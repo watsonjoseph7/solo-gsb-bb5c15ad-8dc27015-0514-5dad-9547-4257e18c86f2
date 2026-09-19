@@ -1,0 +1,29 @@
+services:
+  primer-dimer-api:
+    build: .
+    image: primer-dimer-api:latest
+    container_name: primer-dimer-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 必要配置（均有默认值，可直接启动）
+      PRIMER_DB_PATH: /data/primer_dimer.db
+      PRIMER_HOST: 0.0.0.0
+      PRIMER_PORT: "8000"
+      PRIMER_MAX_PRIMERS: "500"
+      PRIMER_MAX_LENGTH: "200"
+      # 设为 1 会在启动时清空并重建数据库，常规运行保持 0
+      PRIMER_DB_RESET: "0"
+    volumes:
+      # SQLite 数据库持久化到命名卷
+      - primer-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  primer-data:
