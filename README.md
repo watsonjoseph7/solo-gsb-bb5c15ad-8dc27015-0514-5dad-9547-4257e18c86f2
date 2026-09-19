@@ -14,6 +14,10 @@ SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/
 引物复用现有配对算法计算自二聚体、与原批次及候选两两异二聚体，在
 high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳上限的最大无冲突
 候选集合（不落库）；
+通过 `POST /api/batches/{id}/conflict-repair-plan` 对请求指定的 2～28 条
+**批次内引物**按所选风险等级构造含自环的冲突图，以各引物的正整数移除代价
+与受保护名单为约束，用**确定性分支限界**求覆盖全部冲突边的最小代价移除集
+（不落库；保护约束导致无解时返回 409 并列出不可消除冲突）；
 通过 `POST /api/batches/{id}/threshold-map` 只读取已保存配对的两个标量指标
 （最长连续互补、3′端连续互补），用**二维差分**在请求的阈值网格上聚合出每个
 阈值组合下的 high/medium/low 配对数量（不重算对齐、不修改批次）；
@@ -39,6 +43,7 @@ docker compose up --build -d
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
 | 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
 | 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
+| 冲突修复规划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
@@ -394,6 +399,98 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../augmentation-plan
   `counterpart_kind: "candidate"`（只会列出最终入选的候选；与其他落选候选的
   冲突不构成阻断）。
 
+### `POST /api/batches/{id}/conflict-repair-plan` — 批次内引物冲突修复（最小代价移除集，不落库）
+
+对已保存批次，指定 **2～28 条批次内引物**参与修复规划：服务按请求选择的
+风险等级在这些引物上构造**含自环的冲突图**，并为每条引物给定的**正整数移除
+代价**与**受保护名单**，用**确定性分支限界**精确求出覆盖全部冲突边的
+**最小代价移除集**：
+
+* **冲突图**：只使用批次已落库的配对结果（不重算对齐）。指定引物中，
+  自二聚体风险等级命中 `risk_levels`（`high`/`medium`/`low`，可多选、
+  自动去重）的引物带**自环**；两指定引物间的异二聚体命中时连一条**冲突边**；
+* **移除规则**：自环节点**强制移除**（`reason: "self_loop"`）；受保护节点
+  **不可移除**，其冲突边只能由另一端覆盖，故受保护节点的邻居被强制移除
+  （`reason: "protected_neighbor"`）；其余移除由分支限界最优选择
+  （`reason: "branch_and_bound"`）；
+* **决胜规则**：依次以 ① **移除总成本**最小、② **移除数量**最少、
+  ③ **批次位置升序序列**字典序最小 取唯一解（与请求中 primers 的排列
+  顺序无关，相同输入结果稳定可复现）；
+* **无解（409）**：自环落在受保护引物、或冲突边两端均受保护时问题无解，
+  返回 `409` 并在 `detail.unresolvable_conflicts` 中按批次位置升序列出全部
+  不可消除冲突；
+* **不落库**：纯读操作，不修改批次、引物与已保存配对，也不新建批次；
+* 批次不存在返回 `404`；引物数量超出 2～28、移除代价非正整数、引物名
+  为空/重复（去首尾空白后比较）/不在批次内、风险等级非法、受保护名称为空/
+  重复/未出现在 `primers` 中返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-repair-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "risk_levels": ["high", "medium"],
+    "primers": [
+      {"name": "F",  "removal_cost": 5},
+      {"name": "R",  "removal_cost": 1},
+      {"name": "HP", "removal_cost": 2}
+    ],
+    "protected_names": ["R"]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `risk_levels` | 构成冲突的风险等级列表，取值 `high`/`medium`/`low`，至少 1 个；重复值去重 |
+| `primers` | 2～28 条批次内引物；`name` 必须是批次内已存在的引物名（唯一），`removal_cost` 为正整数移除代价 |
+| `protected_names` | 可选，受保护（不可移除）的引物名称列表，必须出现在 `primers` 中 |
+
+返回示例（批次含 F、R、HP 三条引物，F-R 异二聚体 high、HP 自二聚体 high）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "risk_levels": ["high", "medium"],
+  "primer_count": 3,
+  "removed_count": 2,
+  "kept_count": 1,
+  "total_cost": 7,
+  "removed": [
+    {"position": 0, "name": "F", "removal_cost": 5, "reason": "protected_neighbor"},
+    {"position": 2, "name": "HP", "removal_cost": 2, "reason": "self_loop"}
+  ],
+  "kept": [
+    {"position": 1, "name": "R", "removal_cost": 1, "protected": true}
+  ],
+  "covered_conflicts": [
+    {
+      "kind": "edge",
+      "position_a": 0, "position_b": 1,
+      "name_a": "F", "name_b": "R",
+      "risk_level": "high",
+      "covered_by_positions": [0],
+      "covered_by_names": ["F"]
+    },
+    {
+      "kind": "self_loop",
+      "position_a": 2, "position_b": 2,
+      "name_a": "HP", "name_b": "HP",
+      "risk_level": "high",
+      "covered_by_positions": [2],
+      "covered_by_names": ["HP"]
+    }
+  ]
+}
+```
+
+* `removed` / `kept` 均按批次位置升序；`total_cost` 为移除项代价之和；
+* `covered_conflicts` 按两端批次位置升序列出全部被覆盖冲突（`kind` 为
+  `self_loop` 或 `edge`），`covered_by_*` 给出覆盖该冲突的被移除引物
+  （至少一个；两端都被移除时均列出）；
+* 上例中 R 受保护，F-R 冲突边只能由 F 覆盖（尽管 R 更便宜），HP 因自环
+  强制移除。
+
 ### `POST /api/batches/{id}/threshold-map` — 阈值扫描地图
 
 对**已保存批次**做一次“阈值敏感性扫描”：请求给出连续互补阈值与 3′端阈值的
@@ -624,12 +721,13 @@ app/
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
   augmentation.py # 候选增量冲突图上的确定性分支限界（容量受限最大独立集）
+  repair.py     # 含自环冲突图上的确定性分支限界（最小代价顶点覆盖/移除集）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、阈值地图与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图与对比编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

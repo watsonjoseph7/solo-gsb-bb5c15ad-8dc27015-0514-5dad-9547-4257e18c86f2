@@ -16,6 +16,8 @@ from .schemas import (
     BatchList,
     BatchResult,
     BatchSummary,
+    ConflictRepairPlanOut,
+    ConflictRepairPlanRequest,
     PairOut,
     PoolPlanOut,
     PoolPlanRequest,
@@ -26,10 +28,12 @@ from .schemas import (
     ThresholdMapRequest,
 )
 from .services import (
+    ProtectionInfeasibleError,
     build_batch_threshold_map,
     compare_batches,
     plan_batch_augmentation,
     plan_batch_pools,
+    plan_conflict_repair,
     rank_replacements,
     run_batch,
 )
@@ -262,6 +266,56 @@ def create_augmentation_plan(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return AugmentationPlanOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/conflict-repair-plan",
+    tags=["batches"],
+    summary="批次内引物冲突修复：含自环冲突图上的最小代价移除集（不落库）",
+    response_model=ConflictRepairPlanOut,
+    responses={
+        404: {"description": "批次不存在"},
+        409: {"description": "受保护约束导致部分冲突不可消除"},
+        422: {"description": "引物名未知/重复、保护名单非法或参数越界"},
+    },
+)
+def create_conflict_repair_plan(
+    batch_id: str, payload: ConflictRepairPlanRequest
+) -> ConflictRepairPlanOut:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    primers: list[tuple[str, int]] = []
+    for p in payload.primers:
+        if p.name in seen:
+            duplicates.append(p.name)
+        seen.add(p.name)
+        primers.append((p.name, p.removal_cost))
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"引物名称重复: {', '.join(duplicates)}",
+        )
+
+    try:
+        result = plan_conflict_repair(
+            batch_id=batch_id,
+            risk_levels=payload.risk_levels,
+            primers=primers,
+            protected_names=payload.protected_names,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProtectionInfeasibleError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "受保护约束导致部分冲突不可消除",
+                "unresolvable_conflicts": exc.conflicts,
+            },
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return ConflictRepairPlanOut(**result)
 
 
 @app.post(

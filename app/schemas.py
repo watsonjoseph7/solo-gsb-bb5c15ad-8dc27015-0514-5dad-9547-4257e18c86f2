@@ -449,3 +449,143 @@ class ThresholdMapOut(BaseModel):
     cells: list[ThresholdMapCellOut] = Field(
         description="按 3′端阈值、连续互补阈值升序的逐单元三级计数"
     )
+
+
+class ConflictRepairPrimerIn(BaseModel):
+    name: str = Field(..., description="批次内已存在的引物名称（去首尾空白）")
+    removal_cost: int = Field(
+        ..., ge=1, le=1_000_000_000, description="正整数移除代价"
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("引物名称不能为空")
+        return v
+
+
+class ConflictRepairPlanRequest(BaseModel):
+    risk_levels: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "构成冲突的风险等级（仅 high/medium/low）：自二聚体产生自环、"
+            "异二聚体产生冲突边。重复值自动去重"
+        ),
+    )
+    primers: list[ConflictRepairPrimerIn] = Field(
+        ..., min_length=2, max_length=28,
+        description="参与修复规划的批次内引物（2～28 条，名称唯一）",
+    )
+    protected_names: list[str] = Field(
+        default_factory=list,
+        description="受保护（不可移除）的引物名称，必须出现在 primers 中",
+    )
+
+    @field_validator("risk_levels")
+    @classmethod
+    def _risk_levels(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for value in values:
+            level = value.strip().lower()
+            if level not in _RISK_LEVELS:
+                bad.append(value)
+            elif level not in normalized:
+                normalized.append(level)
+        if bad:
+            raise ValueError(
+                "风险等级仅支持 high/medium/low，非法值: "
+                + ", ".join(repr(v) for v in bad)
+            )
+        return normalized
+
+    @field_validator("protected_names")
+    @classmethod
+    def _protected_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            name = value.strip()
+            if not name:
+                raise ValueError("受保护名称不能为空")
+            normalized.append(name)
+        return normalized
+
+    @model_validator(mode="after")
+    def _check_protected(self) -> "ConflictRepairPlanRequest":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for name in self.protected_names:
+            if name in seen:
+                duplicates.append(name)
+            seen.add(name)
+        if duplicates:
+            raise ValueError(
+                "受保护名称重复: " + ", ".join(duplicates)
+            )
+        primer_names = {p.name for p in self.primers}
+        unknown = [n for n in self.protected_names if n not in primer_names]
+        if unknown:
+            raise ValueError(
+                "受保护名称未出现在 primers 中: " + ", ".join(unknown)
+            )
+        return self
+
+
+class RepairConflictRefOut(BaseModel):
+    """一条冲突的引用信息（409 响应中亦用于列出不可消除冲突）。"""
+
+    kind: str = Field(description="self_loop=自二聚体自环；edge=异二聚体冲突边")
+    position_a: int = Field(description="冲突一端在批次中的位置")
+    position_b: int = Field(description="冲突另一端在批次中的位置（自环时与 position_a 相同）")
+    name_a: str
+    name_b: str
+    risk_level: str = Field(description="high / medium / low")
+
+
+class RepairConflictOut(RepairConflictRefOut):
+    covered_by_positions: list[int] = Field(
+        description="覆盖该冲突的被移除引物批次位置（升序，至少一个）"
+    )
+    covered_by_names: list[str] = Field(
+        description="与 covered_by_positions 一一对应的引物名称"
+    )
+
+
+class RepairRemovedOut(BaseModel):
+    position: int = Field(description="引物在批次中的位置")
+    name: str
+    removal_cost: int
+    reason: str = Field(
+        description=(
+            "移除原因：self_loop=自环强制；protected_neighbor=受保护邻居强制；"
+            "branch_and_bound=分支限界最优选择"
+        )
+    )
+
+
+class RepairKeptOut(BaseModel):
+    position: int = Field(description="引物在批次中的位置")
+    name: str
+    removal_cost: int
+    protected: bool = Field(description="该引物是否受保护（不可移除）")
+
+
+class ConflictRepairPlanOut(BaseModel):
+    batch_id: str
+    risk_levels: list[str] = Field(description="本次用于构造冲突图的风险等级")
+    primer_count: int = Field(description="请求指定的引物数")
+    removed_count: int
+    kept_count: int
+    total_cost: int = Field(description="移除项的移除代价总和")
+    removed: list[RepairRemovedOut] = Field(
+        description="最小代价移除集（按批次位置升序）"
+    )
+    kept: list[RepairKeptOut] = Field(
+        description="保留的引物（按批次位置升序）"
+    )
+    covered_conflicts: list[RepairConflictOut] = Field(
+        description="全部被覆盖冲突（按两端批次位置升序）"
+    )

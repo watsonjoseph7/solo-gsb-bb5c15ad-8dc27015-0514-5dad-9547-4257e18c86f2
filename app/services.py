@@ -11,7 +11,20 @@ from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
+from .repair import minimum_cost_cover
 from .threshold_map import build_threshold_map
+
+
+class ProtectionInfeasibleError(Exception):
+    """受保护约束使冲突无法全部消除（路由层转 409）。
+
+    ``conflicts`` 为不可消除冲突的展示字典列表（kind/位置/名称/风险等级），
+    按两端批次位置升序排列。
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        super().__init__("受保护约束导致部分冲突不可消除")
+        self.conflicts = conflicts
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -527,6 +540,146 @@ def plan_batch_augmentation(
         "rejected_count": len(rejected_out),
         "selected": selected_out,
         "rejected": rejected_out,
+    }
+
+
+def plan_conflict_repair(
+    *,
+    batch_id: str,
+    risk_levels: list[str],
+    primers: list[tuple[str, int]],
+    protected_names: list[str],
+) -> dict | None:
+    """对已保存批次内指定引物做冲突修复规划（不落库）。
+
+    纯读操作：只读取批次已落库的配对结果，按请求指定的风险等级在指定引物
+    子集上构造含自环的冲突图（自二聚体 → 自环，异二聚体 → 无向边），用
+    确定性分支限界求覆盖全部冲突边的最小代价移除集，依次以移除总成本、
+    移除数量、批次位置升序序列决胜。不修改批次、引物与已保存配对。
+
+    批次不存在返回 None（路由层转 404）；请求引物名不在批次内抛出
+    ValueError（路由层转 422）；受保护约束使问题无解抛出
+    ProtectionInfeasibleError（路由层转 409）。primers 为
+    (name, removal_cost) 列表，名称唯一性、数量上下界与 protected_names
+    合法性由请求模型与路由层保证。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        batch_primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    position_by_name = {row["name"]: row["position"] for row in batch_primers}
+    unknown = [name for name, _ in primers if name not in position_by_name]
+    if unknown:
+        raise ValueError(
+            "批次内不存在名为 " + ", ".join(repr(n) for n in unknown) + " 的引物"
+        )
+
+    # 顶点按批次位置升序重排：决胜规则中的“批次位置序列”即顶点号升序元组
+    ordered = sorted(primers, key=lambda item: position_by_name[item[0]])
+    m = len(ordered)
+    index_by_name = {name: i for i, (name, _) in enumerate(ordered)}
+    costs = [cost for _, cost in ordered]
+    positions = [position_by_name[name] for name, _ in ordered]
+    protected_idx = frozenset(index_by_name[n] for n in protected_names)
+
+    # 冲突图：自二聚体命中所选等级 → 自环；两端都在指定集合内的异二聚体 → 边
+    levels = set(risk_levels)
+    self_loops: set[int] = set()
+    edges: set[tuple[int, int]] = set()
+    conflicts: list[dict] = []
+    for row in pairs:
+        if row["risk_level"] not in levels:
+            continue
+        name_a, name_b = row["name_top"], row["name_bottom"]
+        if row["is_self_dimer"]:
+            if name_a not in index_by_name:
+                continue
+            u = index_by_name[name_a]
+            self_loops.add(u)
+            conflicts.append(
+                {"kind": "self_loop", "u": u, "v": u,
+                 "risk_level": row["risk_level"]}
+            )
+        else:
+            if name_a not in index_by_name or name_b not in index_by_name:
+                continue
+            u, v = index_by_name[name_a], index_by_name[name_b]
+            a, b = (u, v) if u < v else (v, u)
+            edges.add((a, b))
+            conflicts.append(
+                {"kind": "edge", "u": a, "v": b,
+                 "risk_level": row["risk_level"]}
+            )
+    conflicts.sort(key=lambda c: (positions[c["u"]], positions[c["v"]]))
+
+    def _conflict_ref_out(c: dict) -> dict:
+        return {
+            "kind": c["kind"],
+            "position_a": positions[c["u"]],
+            "position_b": positions[c["v"]],
+            "name_a": ordered[c["u"]][0],
+            "name_b": ordered[c["v"]][0],
+            "risk_level": c["risk_level"],
+        }
+
+    # 受保护约束可行性：自环落在受保护顶点、或冲突边两端均受保护
+    unresolvable = [
+        c for c in conflicts
+        if (c["kind"] == "self_loop" and c["u"] in protected_idx)
+        or (c["kind"] == "edge"
+            and c["u"] in protected_idx and c["v"] in protected_idx)
+    ]
+    if unresolvable:
+        raise ProtectionInfeasibleError([_conflict_ref_out(c) for c in unresolvable])
+
+    cover = minimum_cost_cover(
+        costs=costs,
+        protected=protected_idx,
+        self_loops=frozenset(self_loops),
+        edges=sorted(edges),
+    )
+    if cover is None:  # 可行性已在上文拦截，防御性兜底
+        raise ProtectionInfeasibleError([])
+
+    removed_set = set(cover.removed)
+
+    def _conflict_out(c: dict) -> dict:
+        endpoints = (c["u"],) if c["kind"] == "self_loop" else (c["u"], c["v"])
+        covering = [i for i in endpoints if i in removed_set]
+        return {
+            **_conflict_ref_out(c),
+            "covered_by_positions": [positions[i] for i in covering],
+            "covered_by_names": [ordered[i][0] for i in covering],
+        }
+
+    removed_out: list[dict] = []
+    kept_out: list[dict] = []
+    for i, (name, cost) in enumerate(ordered):
+        entry = {"position": positions[i], "name": name, "removal_cost": cost}
+        if i in removed_set:
+            if i in self_loops:
+                reason = "self_loop"
+            elif i in cover.forced:
+                reason = "protected_neighbor"
+            else:
+                reason = "branch_and_bound"
+            removed_out.append({**entry, "reason": reason})
+        else:
+            kept_out.append({**entry, "protected": i in protected_idx})
+
+    return {
+        "batch_id": batch_id,
+        "risk_levels": risk_levels,
+        "primer_count": m,
+        "removed_count": len(removed_out),
+        "kept_count": len(kept_out),
+        "total_cost": sum(costs[i] for i in removed_set),
+        "removed": removed_out,
+        "kept": kept_out,
+        "covered_conflicts": [_conflict_out(c) for c in conflicts],
     }
 
 
