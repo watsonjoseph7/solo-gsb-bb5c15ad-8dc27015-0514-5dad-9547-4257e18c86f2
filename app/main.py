@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import config, db
 from .schemas import (
@@ -16,6 +16,9 @@ from .schemas import (
     BatchList,
     BatchResult,
     BatchSummary,
+    ConflictRepairInfeasibleOut,
+    ConflictRepairPlanOut,
+    ConflictRepairRequest,
     PairOut,
     PoolPlanOut,
     PoolPlanRequest,
@@ -26,9 +29,11 @@ from .schemas import (
     ThresholdMapRequest,
 )
 from .services import (
+    ConflictRepairProtectedError,
     build_batch_threshold_map,
     compare_batches,
     plan_batch_augmentation,
+    plan_batch_conflict_repair,
     plan_batch_pools,
     rank_replacements,
     run_batch,
@@ -262,6 +267,47 @@ def create_augmentation_plan(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return AugmentationPlanOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/conflict-repair-plan",
+    tags=["batches"],
+    summary="批次内引物的最小代价冲突修复计划（分支限界精确解，不修改批次）",
+    response_model=ConflictRepairPlanOut,
+    responses={
+        404: {"description": "批次不存在"},
+        409: {
+            "model": ConflictRepairInfeasibleOut,
+            "description": "保护约束令问题无解：存在不可消除冲突",
+        },
+        422: {"description": "引物位置越界/重复、受保护名称非法或请求结构非法"},
+    },
+)
+def create_conflict_repair_plan(
+    batch_id: str, payload: ConflictRepairRequest
+) -> ConflictRepairPlanOut:
+    try:
+        result = plan_batch_conflict_repair(
+            batch_id=batch_id,
+            risk_levels=payload.risk_levels,
+            primers=[(p.position, p.removal_cost) for p in payload.primers],
+            protected_names=payload.protected_names,
+        )
+    except ConflictRepairProtectedError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "保护约束令问题无解，存在无法被任何移除集覆盖的冲突",
+                "batch_id": batch_id,
+                "risk_levels": payload.risk_levels,
+                "unresolvable_conflicts": exc.edges,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return ConflictRepairPlanOut(**result)
 
 
 @app.post(

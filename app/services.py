@@ -11,7 +11,16 @@ from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
+from .repair import InfeasibleRepair, minimum_cost_removal
 from .threshold_map import build_threshold_map
+
+
+class ConflictRepairProtectedError(ValueError):
+    """保护约束使修复问题无解（路由层转 409）。"""
+
+    def __init__(self, edges: list[dict]):
+        self.edges = edges
+        super().__init__(f"存在 {len(edges)} 条保护约束下不可消除的冲突")
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -588,6 +597,169 @@ def build_batch_threshold_map(
         "batch_continuous_threshold": batch_ct,
         "batch_three_prime_threshold": batch_tt,
         "cells": cells,
+    }
+
+
+def plan_batch_conflict_repair(
+    *,
+    batch_id: str,
+    risk_levels: list[str],
+    primers: list[tuple[int, int]],
+    protected_names: list[str],
+) -> dict | None:
+    """对已保存批次的指定引物做最小代价冲突修复计划（纯读，不修改批次）。
+
+    仅使用已落库的配对结果构造冲突图：请求引物的自二聚体命中所选风险
+    等级时记自环（强制移除），请求引物两两间命中等级的异二聚体记普通
+    无向边；图上用确定性分支限界求覆盖全部冲突边的最小代价移除集，
+    依次以移除总代价、移除数量、批次位置序列决胜。受保护引物不可移除；
+    保护约束令问题无解时抛出 ConflictRepairProtectedError（路由层转
+    409），并列出全部不可消除冲突。
+
+    批次不存在返回 None（路由层转 404）；请求引物位置越界/重复、受保护
+    名称不在批次或请求引物内抛出 ValueError（路由层转 422）。primers 为
+    (position, removal_cost) 列表，由请求模型保证 2～28 条、代价为正整数。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        batch_primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    positions = [position for position, _ in primers]
+    duplicate_positions = sorted(
+        {position for position in positions if positions.count(position) > 1}
+    )
+    if duplicate_positions:
+        raise ValueError(
+            "请求引物位置重复: " + ", ".join(str(p) for p in duplicate_positions)
+        )
+
+    name_by_position = {row["position"]: row["name"] for row in batch_primers}
+    out_of_range = [
+        position for position in positions if position not in name_by_position
+    ]
+    if out_of_range:
+        raise ValueError(
+            "批次内不存在这些位置的引物: "
+            + ", ".join(str(p) for p in sorted(out_of_range))
+        )
+
+    protected_set = set(protected_names)
+    batch_names = set(name_by_position.values())
+    unknown_protected = sorted(protected_set - batch_names)
+    if unknown_protected:
+        raise ValueError(
+            "受保护引物名称不存在于批次: " + ", ".join(unknown_protected)
+        )
+    requested_names = {name_by_position[position] for position in positions}
+    outside_request = sorted(protected_set - requested_names)
+    if outside_request:
+        raise ValueError(
+            "受保护引物不在请求指定的引物范围内: " + ", ".join(outside_request)
+        )
+
+    # 按批次位置升序规范化为求解器的本地下标 0..m-1
+    ordered = sorted(primers, key=lambda item: item[0])
+    local_by_position = {position: i for i, (position, _) in enumerate(ordered)}
+    position_by_name = {name: pos for pos, name in name_by_position.items()}
+    costs = [cost for _, cost in ordered]
+    protected = frozenset(
+        local_by_position[position]
+        for position in positions
+        if name_by_position[position] in protected_set
+    )
+
+    levels = set(risk_levels)
+    requested_position_set = set(positions)
+    edges: list[tuple[int, int]] = []
+    edge_meta: dict[tuple[int, int], str] = {}
+    for row in pairs:
+        if row["risk_level"] not in levels:
+            continue
+        if row["is_self_dimer"]:
+            # 自二聚体行的 top/bottom 同名
+            position = position_by_name.get(row["name_top"])
+            if position not in requested_position_set:
+                continue
+            local = local_by_position[position]
+            edge = (local, local)
+        else:
+            pos_a = position_by_name.get(row["name_top"])
+            pos_b = position_by_name.get(row["name_bottom"])
+            if (
+                pos_a not in requested_position_set
+                or pos_b not in requested_position_set
+            ):
+                continue
+            edge = (local_by_position[pos_a], local_by_position[pos_b])
+        edges.append(edge)
+        edge_meta[(min(edge), max(edge))] = row["risk_level"]
+
+    def _edge_out(local_a: int, local_b: int, *, reason: str | None = None) -> dict:
+        pos_a = ordered[local_a][0]
+        pos_b = ordered[local_b][0]
+        out = {
+            "position_a": pos_a,
+            "position_b": pos_b,
+            "name_a": name_by_position[pos_a],
+            "name_b": name_by_position[pos_b],
+            "is_self_dimer": local_a == local_b,
+            "risk_level": edge_meta[(min(local_a, local_b), max(local_a, local_b))],
+        }
+        if reason is not None:
+            out["reason"] = reason
+        return out
+
+    try:
+        plan = minimum_cost_removal(edges, costs=costs, protected=protected)
+    except InfeasibleRepair as exc:
+        unresolvable: list[dict] = []
+        for local_a, local_b in exc.edges:
+            reason = (
+                "protected_self_loop" if local_a == local_b else "protected_pair"
+            )
+            unresolvable.append(_edge_out(local_a, local_b, reason=reason))
+        raise ConflictRepairProtectedError(unresolvable) from exc
+
+    removed_set = set(plan.removed)
+
+    def _item(local: int) -> dict:
+        position, cost = ordered[local]
+        return {
+            "position": position,
+            "name": name_by_position[position],
+            "removal_cost": cost,
+            "protected": local in protected,
+        }
+
+    removed_out = [_item(local) for local in plan.removed]
+    retained_out = [_item(local) for local in plan.retained]
+
+    covered: list[dict] = []
+    for local_a, local_b in sorted((min(e), max(e)) for e in edges):
+        edge_out = _edge_out(local_a, local_b)
+        covering = [
+            name_by_position[ordered[local][0]]
+            for local in (local_a, local_b)
+            if local in removed_set
+        ]
+        # 自环两端同名，去重
+        edge_out["covered_by"] = sorted(set(covering))
+        covered.append(edge_out)
+
+    return {
+        "batch_id": batch_id,
+        "risk_levels": risk_levels,
+        "primer_count": len(ordered),
+        "conflict_count": len(edges),
+        "removed_count": len(removed_out),
+        "retained_count": len(retained_out),
+        "total_removal_cost": sum(costs[local] for local in plan.removed),
+        "removed": removed_out,
+        "retained": retained_out,
+        "covered_conflicts": covered,
     }
 
 

@@ -17,6 +17,10 @@ high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳�
 通过 `POST /api/batches/{id}/threshold-map` 只读取已保存配对的两个标量指标
 （最长连续互补、3′端连续互补），用**二维差分**在请求的阈值网格上聚合出每个
 阈值组合下的 high/medium/low 配对数量（不重算对齐、不修改批次）；
+通过 `POST /api/batches/{id}/conflict-repair-plan` 对请求指定的 2～28 条
+批次内引物，按所选风险等级构造**含自环的冲突图**，用**确定性分支限界**求
+覆盖全部冲突边的最小代价移除集（自环强制移除、受保护引物不可移除；保护约束
+令问题无解返回 409 并列出不可消除冲突；不修改批次）；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
 对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
 
@@ -40,6 +44,7 @@ docker compose up --build -d
 | 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
 | 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
+| 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
@@ -465,6 +470,119 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../threshold-map \
 * 原阈值单元的三级计数与批次摘要中的
   `high_risk_count` / `medium_risk_count` / `low_risk_count` 一致。
 
+### `POST /api/batches/{id}/conflict-repair-plan` — 最小代价冲突修复计划（分支限界精确解，不修改批次）
+
+对**已保存批次**中请求指定的 **2～28 条引物**，按请求选择的风险等级
+（`high`/`medium`/`low`，可多选、自动去重）从**已落库配对**构造含自环的冲突图，
+并给出移除哪些引物可覆盖全部冲突的精确最优计划：
+
+* **冲突图**：请求引物为顶点（顶点即批次位置）。引物的**自二聚体**命中所选
+  风险等级时记**自环** (v, v)；请求引物两两之间的命中异二聚体记普通无向边。
+  与请求范围外引物的配对不参与；
+* **移除代价**：请求为每条引物给出**正整数** `removal_cost`；
+* **最小代价移除集（加权顶点覆盖）**：用**确定性分支限界**精确求解，候选移除集
+  依次以 **① 移除总代价**（小者优先）、**② 移除数量**（少者优先）、
+  **③ 批次位置序列**（升序元组字典序小者优先）决胜，全序无并列，结果稳定可复现；
+* **自环强制移除**：自环只能由该引物自身覆盖，故带自环的引物（未受保护时）
+  必在移除集中，并参与对其普通边的覆盖级联；
+* **受保护引物不可移除**：请求以名称给出 `protected_names`（须均为批次内且在
+  本次请求范围内的引物，允许空列表，自动去重）。受保护引物的**自环**或一条
+  **两端均受保护**的普通边无法被任何移除集覆盖，此时返回 **`409`** 并在
+  `unresolvable_conflicts` 中列出**全部**不可消除冲突（`protected_self_loop` /
+  `protected_pair`），不返回移除计划；
+* **不修改批次**：纯读操作，只使用已保存配对，不重算对齐、不写库。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-repair-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "risk_levels": ["high", "medium"],
+    "primers": [
+      {"position": 0, "removal_cost": 5},
+      {"position": 1, "removal_cost": 2},
+      {"position": 2, "removal_cost": 9}
+    ],
+    "protected_names": ["F"]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `risk_levels` | 构成冲突边的配对风险等级，取值 `high`/`medium`/`low`（大小写、首尾空白自动规范化），至少 1 个；重复值去重 |
+| `primers` | 2～28 条请求引物；`position` 为批次位置（0 起，不可越界、不可重复），`removal_cost` 为 ≥1 的正整数移除代价 |
+| `protected_names` | 受保护、不可移除的引物名称（去首尾空白后比较、自动去重）；须均为批次内且在 `primers` 范围内的引物，允许为空列表 |
+
+返回示例（批次 `F=0/R=1` 间为 high，保护 F）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "risk_levels": ["high", "medium"],
+  "primer_count": 3,
+  "conflict_count": 1,
+  "removed_count": 1,
+  "retained_count": 2,
+  "total_removal_cost": 2,
+  "removed": [
+    {"position": 1, "name": "R", "removal_cost": 2, "protected": false}
+  ],
+  "retained": [
+    {"position": 0, "name": "F", "removal_cost": 5, "protected": true},
+    {"position": 2, "name": "P2", "removal_cost": 9, "protected": false}
+  ],
+  "covered_conflicts": [
+    {
+      "position_a": 0, "position_b": 1,
+      "name_a": "F", "name_b": "R",
+      "is_self_dimer": false,
+      "risk_level": "high",
+      "covered_by": ["R"]
+    }
+  ]
+}
+```
+
+* `removed` / `retained` 均按批次位置升序；`retained` 含全部未移除引物
+  （包括受保护引物，`protected: true`）；`removed_count + retained_count`
+  恒等于 `primer_count`；
+* `total_removal_cost` 恒等于 `removed` 各项 `removal_cost` 之和；
+* `covered_conflicts` 列出命中风险等级的**全部**冲突边（含自环，按
+  `position_a`、`position_b` 升序），长度恒等于 `conflict_count`；每条边的
+  `covered_by` 给出实际覆盖它的被移除引物名称（普通边 1～2 个、自环恰 1 个），
+  自环时 `position_a == position_b` 且 `is_self_dimer: true`；
+* 不存在冲突边时 `removed` 为空、`total_removal_cost` 为 0、全部引物保留。
+
+保护约束无解时返回 **`409`**：
+
+```json
+{
+  "detail": "保护约束令问题无解，存在无法被任何移除集覆盖的冲突",
+  "batch_id": "f98cdd27-...",
+  "risk_levels": ["high"],
+  "unresolvable_conflicts": [
+    {
+      "position_a": 0, "position_b": 1,
+      "name_a": "F", "name_b": "R",
+      "is_self_dimer": false,
+      "risk_level": "high",
+      "reason": "protected_pair"
+    },
+    {
+      "position_a": 2, "position_b": 2,
+      "name_a": "H", "name_b": "H",
+      "is_self_dimer": true,
+      "risk_level": "high",
+      "reason": "protected_self_loop"
+    }
+  ]
+}
+```
+
+* 批次不存在返回 `404`；引物位置越界/重复、受保护名称不属于批次或不在请求
+  `primers` 范围内、引物数量超出 2～28、移除代价 < 1、风险等级非法返回 `422`。
+
 ### `GET /api/batches/{base_id}/compare/{target_id}` — 批次风险对比
 
 按引物**名称**构造稳定配对键，对比 base → target 两个已保存批次的配对风险：
@@ -624,12 +742,13 @@ app/
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
   augmentation.py # 候选增量冲突图上的确定性分支限界（容量受限最大独立集）
+  repair.py     # 批次内含自环冲突图上的确定性分支限界（最小代价顶点覆盖/移除集）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、阈值地图与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图与对比编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试
